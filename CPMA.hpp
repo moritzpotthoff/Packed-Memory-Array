@@ -648,6 +648,9 @@ public:
   bool exists(key_type e) const { return has(e); }
   bool insert(element_type e);
 
+  uint64_t number_of_threads() { return ParallelTools::getWorkers(); }
+
+  uint64_t insert_batch_sorted(element_ptr_type e, uint64_t batch_size);
   uint64_t insert_batch(element_ptr_type e, uint64_t batch_size);
   uint64_t remove_batch(key_type *e, uint64_t batch_size);
   // split num is the index of which partition you are
@@ -2844,6 +2847,195 @@ uint64_t CPMA<traits>::insert_batch(element_ptr_type e, uint64_t batch_size) {
   sort_batch(e, batch_size);
   sort_timer.stop();
 
+  // TODO(wheatman) currently only works for unsigned types
+  while (e.get() == 0) {
+    has_0 = true;
+    ++e;
+    batch_size -= 1;
+    if (batch_size == 0) {
+      return 0;
+    }
+  }
+
+  // total number of leaves
+  uint64_t num_leaves = total_leaves();
+
+  // which leaves were touched during the merge
+  ParallelTools::Reducer_Vector<std::pair<uint64_t, uint64_t>> leaves_to_check;
+
+  uint64_t num_elts_merged = 0;
+
+  timer merge_timer("merge_timer");
+  merge_timer.start();
+
+  if (false) {
+    ParallelTools::Reducer_sum<uint64_t> num_elts_merged_reduce;
+    // leaves per partition
+    uint64_t split_points =
+        std::min({(uint64_t)num_leaves / 10, (uint64_t)batch_size / 100,
+                  (uint64_t)ParallelTools::getWorkers() * 10});
+    split_points = std::max(split_points, 1UL);
+
+    std::vector<leaf_bound_t> leaf_bounds = get_leaf_bounds(split_points);
+
+    ParallelTools::parallel_for(0, split_points, [&](uint64_t i) {
+      // search for boundaries in batch
+      key_type *batch_start_key =
+          std::lower_bound(e.get_pointer(), e.get_pointer() + batch_size,
+                           leaf_bounds[i].start_elt);
+      // if we are the first batch start at the begining
+      element_ptr_type batch_start = e + (batch_start_key - e.get_pointer());
+      if (i == 0) {
+        batch_start = e;
+      }
+      uint64_t end_elt = leaf_bounds[i].end_elt;
+      if (i == split_points - 1) {
+        end_elt = std::numeric_limits<uint64_t>::max();
+      }
+      key_type *batch_end_key = std::lower_bound(
+          e.get_pointer(), e.get_pointer() + batch_size, end_elt);
+      if (batch_start.get_pointer() == batch_end_key ||
+          batch_start.get_pointer() == e.get_pointer() + batch_size) {
+        return;
+      }
+      // number of elts we are merging
+      uint64_t range_size = uint64_t(batch_end_key - batch_start.get_pointer());
+      // do the merge
+      num_elts_merged_reduce.add(insert_batch_internal(
+          batch_start, range_size, leaves_to_check,
+          leaf_bounds[i].start_leaf_index, leaf_bounds[i].end_leaf_index));
+    });
+    num_elts_merged = num_elts_merged_reduce.get();
+  } else {
+    num_elts_merged += insert_batch_internal_small_batch(
+        e, batch_size, leaves_to_check, 0, num_leaves * elts_per_leaf());
+  }
+  merge_timer.stop();
+
+  // if most leaves need to be redistributed, or many elements were added,
+  // just check the root first to hopefully save walking up the tree
+  timer range_finder_timer("range_finder_timer");
+  range_finder_timer.start();
+  auto [ranges_to_redistribute_3, full_opt] = get_ranges_to_redistibute(
+      leaves_to_check, num_elts_merged, [&](uint64_t level, double density) {
+        return density > upper_density_bound(level);
+      });
+  range_finder_timer.stop();
+
+#if DEBUG == 1
+  auto [ranges_debug, full_opt_debug] =
+      get_ranges_to_redistibute_debug(leaves_to_check, num_elts_merged);
+  if (ranges_to_redistribute_3.size() != ranges_debug.size()) {
+    printf("sizes don't match, got %lu, expected %lu\n",
+           ranges_to_redistribute_3.size(), ranges_debug.size());
+    printf("got:\n");
+    for (const auto &element : ranges_to_redistribute_3) {
+      std::cout << "( " << std::get<0>(element) << ", "
+                << std::get<1>(element) / sizeof(key_type) << ") ";
+    }
+    std::cout << std::endl;
+    printf("correct:\n");
+    for (const auto &element : ranges_debug) {
+      std::cout << "( " << std::get<0>(element) << ", "
+                << std::get<1>(element) / sizeof(key_type) << ") ";
+    }
+    std::cout << std::endl;
+  } else {
+    // Optimized code might not give these sorted
+    // just sort them first to make checking easier
+    std::sort(ranges_to_redistribute_3.begin(), ranges_to_redistribute_3.end());
+    for (size_t i = 0; i < ranges_to_redistribute_3.size(); i++) {
+      if (ranges_to_redistribute_3[i] != ranges_debug[i]) {
+        printf("element %lu doesn't match, got (%lu, %lu), expected (%lu,"
+               "%lu)\n",
+               i, std::get<0>(ranges_to_redistribute_3[i]),
+               std::get<1>(ranges_to_redistribute_3[i]),
+               std::get<0>(ranges_debug[i]), std::get<1>(ranges_debug[i]));
+      }
+    }
+  }
+
+  assert(ranges_to_redistribute_3 == ranges_debug);
+  assert(full_opt == full_opt_debug);
+#endif
+
+  // doubling everything
+  if (full_opt.has_value()) {
+    timer double_timer("doubling");
+    double_timer.start();
+
+    uint64_t target_size = N();
+    uint64_t grow_times = 0;
+    auto bytes_occupied = full_opt.value();
+
+    // min bytes necessary to meet the density bound
+    // uint64_t bytes_required = bytes_occupied / upper_density_bound(0);
+    uint64_t bytes_required =
+        std::max(N() * growing_factor, bytes_occupied * growing_factor);
+
+    while (target_size <= bytes_required) {
+      target_size *= growing_factor;
+      grow_times += 1;
+    }
+
+    grow_list(grow_times);
+    double_timer.stop();
+  } else { // not doubling
+    // in parallel, redistribute ranges
+
+    timer redistribute_timer("redistributing");
+    redistribute_timer.start();
+    redistribute_ranges(ranges_to_redistribute_3);
+    redistribute_timer.stop();
+  }
+  assert(check_nothing_full());
+
+  assert(check_leaf_heads());
+  count_elements_ += num_elts_merged;
+  total_timer.stop();
+  return num_elts_merged;
+}
+
+// input: batch, number of elts in a batch
+// return true if the element was inserted, false if it was already there
+// return number of things inserted (not already there)
+template <typename traits>
+uint64_t CPMA<traits>::insert_batch_sorted(element_ptr_type e, uint64_t batch_size) {
+  timer total_timer("insert_batch");
+  total_timer.start();
+  if (batch_size < 100) {
+    uint64_t count = 0;
+    for (uint64_t i = 0; i < batch_size; i++) {
+      count += insert(e[i]);
+    }
+    return count;
+  }
+
+  // TODO(wheatman) make it work for the first batch
+  if (get_element_count() == 0) {
+    uint64_t count = 0;
+    uint64_t end = std::min(batch_size, 1000UL);
+    for (uint64_t i = 0; i < end; i++) {
+      count += insert(e[i]);
+    }
+    if (batch_size == end) {
+      total_timer.stop();
+      return count;
+    } else {
+      e = e + end;
+      batch_size -= end;
+      return count + insert_batch(e, batch_size);
+    }
+  }
+
+  assert(check_leaf_heads());
+/*
+  timer sort_timer("sort");
+
+  sort_timer.start();
+  sort_batch(e, batch_size);
+  sort_timer.stop();
+*/
   // TODO(wheatman) currently only works for unsigned types
   while (e.get() == 0) {
     has_0 = true;
