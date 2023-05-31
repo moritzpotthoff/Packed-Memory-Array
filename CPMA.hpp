@@ -3751,11 +3751,13 @@ void CPMA<traits>::map_range_profile(F f, key_type start_key, key_type end_key, 
     for (auto it = start; it != end(); ++it) {
         auto el = *it;
         if (el >= end_key) {
+            profiler.endPhase(Helpers::Profiler::Phase::RANGE_QUERY_ITERATION);
             return;
         }
         assert(el >= start_key && el < end_key);
         if constexpr (!no_early_exit) {
             if (f(el)) {
+                profiler.endPhase(Helpers::Profiler::Phase::RANGE_QUERY_ITERATION);
                 return;
             }
         } else {
