@@ -797,6 +797,9 @@ public:
   template <bool no_early_exit = true, class F>
   void map_range(F f, key_type start_key, key_type end_key) const;
 
+  template <bool no_early_exit = true, class F, typename Profiler>
+  void map_range_profile(F f, key_type start_key, key_type end_key, Profiler &profiler) const;
+
   template <class F>
   void map_range_length(F f, key_type start, uint64_t length) const;
 
@@ -3737,6 +3740,32 @@ void CPMA<traits>::map_range(F f, key_type start_key, key_type end_key) const {
 }
 
 template <typename traits>
+template <bool no_early_exit, class F, typename Profiler>
+void CPMA<traits>::map_range_profile(F f, key_type start_key, key_type end_key, Profiler &profiler) const {
+    profiler.startPhase(Helpers::Profiler::Phase::RANGE_QUERY_SEARCH);
+    auto start = lower_bound(start_key);
+    profiler.endPhase(Helpers::Profiler::Phase::RANGE_QUERY_SEARCH);
+
+    profiler.startPhase(Helpers::Profiler::Phase::RANGE_QUERY_ITERATION);
+#pragma clang loop unroll_count(4)
+    for (auto it = start; it != end(); ++it) {
+        auto el = *it;
+        if (el >= end_key) {
+            return;
+        }
+        assert(el >= start_key && el < end_key);
+        if constexpr (!no_early_exit) {
+            if (f(el)) {
+                return;
+            }
+        } else {
+            f(el);
+        }
+    }
+    profiler.endPhase(Helpers::Profiler::Phase::RANGE_QUERY_ITERATION);
+}
+
+template <typename traits>
 template <class F>
 void CPMA<traits>::map_range_length(F f, key_type start,
                                     uint64_t length) const {
@@ -3902,3 +3931,4 @@ CPMA<traits>::getApproximateDegreeVector(typename leaf::iterator *hints) const {
 }
 
 #endif
+
